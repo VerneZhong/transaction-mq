@@ -1,11 +1,6 @@
 name: UR House Watcher
 
 on:
-  push:
-    branches: [master]
-    paths:
-      - "ur-house-watcher/check_ur.py"
-      - ".github/workflows/ur-house-watcher.yml"
   schedule:
     # GitHub cron is UTC. Run every 10 minutes from 07:00 through 23:50 JST.
     # JST 07:00-23:50 = UTC 22:00-14:50 (crosses midnight UTC).
