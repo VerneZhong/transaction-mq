@@ -9,12 +9,14 @@ from urllib.parse import urljoin
 
 import requests
 import yaml
+from bs4 import BeautifulSoup
 
 ROOT = Path(__file__).resolve().parent
 STATE_FILE = ROOT / "state.json"
 CONFIG_FILE = ROOT / "config.yml"
 OUTPUT_FILE = ROOT / "notification.md"
-TIMEOUT = 20
+TIMEOUT = 15
+UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
 
 
 def load_json(path, default):
@@ -25,9 +27,7 @@ def load_json(path, default):
 
 
 def room_key(room):
-    raw = room.get("jkss") or room.get("href") or "|".join(
-        str(room.get(k, "")) for k in ("name", "layout", "area", "rent", "room")
-    )
+    raw = room.get("jkss") or room.get("href") or "|".join(str(room.get(k, "")) for k in ("name", "layout", "area", "rent", "room"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
@@ -45,16 +45,46 @@ def parse_area(value):
     return float(m.group(1)) if m else None
 
 
-def candidate_api_urls():
-    # UR's former dedicated API host is no longer reliably resolvable from
-    # GitHub-hosted runners. Try the current public-site routes first and keep
-    # the historical host only as a last fallback.
-    path = "chintai/api/bukken/detail/detail_bukken_room/"
-    return [
-        f"https://www.ur-net.go.jp/{path}",
-        f"https://sumai.r6.ur-net.go.jp/{path}",
-        f"https://chintai.sumai.ur-net.go.jp/{path}",
-    ]
+def discover_api_urls(session, room_page):
+    headers = {"User-Agent": UA, "Accept-Language": "ja-JP,ja;q=0.9"}
+    r = session.get(room_page, headers=headers, timeout=TIMEOUT)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    script_urls = []
+    for s in soup.find_all("script", src=True):
+        u = urljoin(room_page, s["src"])
+        if u not in script_urls:
+            script_urls.append(u)
+
+    print(f"Diagnostic: fetched room page, {len(script_urls)} external scripts")
+    candidates = []
+    for script_url in script_urls:
+        try:
+            js = session.get(script_url, headers=headers, timeout=8).text
+        except Exception:
+            continue
+        if "detail_bukken_room" not in js and "bukken/detail" not in js and "chintai/api" not in js:
+            continue
+        idx = js.find("detail_bukken_room")
+        if idx >= 0:
+            snippet = re.sub(r"\s+", " ", js[max(0, idx-250):idx+350])
+            print(f"Diagnostic match in {script_url}: {snippet[:700]}")
+
+        for m in re.finditer(r"https?://[^\"'\s)]+/chintai/api/", js):
+            candidates.append(m.group(0))
+        for m in re.finditer(r"[\"']([^\"']*bukken/detail/detail_bukken_room/?)[\"']", js):
+            raw = m.group(1)
+            candidates.append(urljoin(room_page, raw))
+
+    out = []
+    for u in candidates:
+        if u.endswith("detail_bukken_room") or u.endswith("detail_bukken_room/"):
+            endpoint = u
+        else:
+            endpoint = urljoin(u, "bukken/detail/detail_bukken_room/")
+        if endpoint not in out:
+            out.append(endpoint)
+    return out
 
 
 def post_room_api(session, target, page_index):
@@ -67,17 +97,26 @@ def post_room_api(session, target, page_index):
         "orderBySort": "0",
         "pageIndex": str(page_index),
     }
+    room_page = target.get("room_url") or target["url"].replace(".html", "_room.html")
     headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1",
+        "User-Agent": UA,
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Accept-Language": "ja-JP,ja;q=0.9",
-        "Referer": target.get("room_url") or target["url"],
+        "Referer": room_page,
         "X-Requested-With": "XMLHttpRequest",
-        "Origin": "https://www.ur-net.go.jp",
     }
 
+    discovered = discover_api_urls(session, room_page) if page_index == 0 else []
+    endpoints = discovered + [
+        "https://www.ur-net.go.jp/chintai/api/bukken/detail/detail_bukken_room/",
+        "https://sumai.r6.ur-net.go.jp/chintai/api/bukken/detail/detail_bukken_room/",
+        "https://chintai.sumai.ur-net.go.jp/chintai/api/bukken/detail/detail_bukken_room/",
+    ]
+    endpoints = list(dict.fromkeys(endpoints))
+    print(f"Diagnostic API candidates for {target['name']}: {endpoints}")
+
     failures = []
-    for api_url in candidate_api_urls():
+    for api_url in endpoints:
         try:
             r = session.post(api_url, data=payload, headers=headers, timeout=TIMEOUT, allow_redirects=True)
             ctype = r.headers.get("content-type", "")
@@ -101,12 +140,10 @@ def post_room_api(session, target, page_index):
 def fetch_vacant_rooms(session, target, layouts, min_area):
     rooms = []
     seen_ids = set()
-
     for page_index in range(20):
         data = post_room_api(session, target, page_index)
         if not data:
             break
-
         new_ids = 0
         reported_total = None
         for item in data:
@@ -117,42 +154,22 @@ def fetch_vacant_rooms(session, target, layouts, min_area):
                     reported_total = int(item.get("allCount"))
                 except (TypeError, ValueError):
                     reported_total = None
-
             room_id = str(item.get("id") or "").strip()
             if not room_id or room_id in seen_ids:
                 continue
             seen_ids.add(room_id)
             new_ids += 1
-
             layout = str(item.get("type") or "").strip()
             area = parse_area(item.get("floorspace"))
             if layout not in layouts or area is None or area < min_area:
                 continue
-
             room_link = item.get("roomDetailLink") or item.get("roomDetailLinkSp")
-            if room_link:
-                href = urljoin("https://www.ur-net.go.jp", room_link)
-            else:
-                room_page = target.get("room_url") or target["url"].replace(".html", "_room.html")
-                href = f"{room_page}?JKSS={room_id}"
-
-            rooms.append({
-                "name": target["name"],
-                "room": str(item.get("name") or "").strip(),
-                "layout": layout,
-                "area": area,
-                "rent": str(item.get("rent") or "").strip(),
-                "commonfee": str(item.get("commonfee") or "").strip(),
-                "floor": str(item.get("floor") or "").strip(),
-                "href": href,
-                "jkss": room_id,
-            })
-
+            href = urljoin("https://www.ur-net.go.jp", room_link) if room_link else f"{target.get('room_url')}?JKSS={room_id}"
+            rooms.append({"name": target["name"], "room": str(item.get("name") or "").strip(), "layout": layout, "area": area, "rent": str(item.get("rent") or "").strip(), "commonfee": str(item.get("commonfee") or "").strip(), "floor": str(item.get("floor") or "").strip(), "href": href, "jkss": room_id})
         if new_ids == 0:
             break
         if reported_total is not None and len(seen_ids) >= reported_total:
             break
-
     print(f"{target['name']}: found {len(rooms)} matching vacant rooms")
     return rooms
 
@@ -168,26 +185,12 @@ def telegram_send_room(room):
     fee = f"（共益費 {room['commonfee']}）" if room.get("commonfee") else ""
     room_name = f" {room['room']}" if room.get("room") else ""
     floor = f" / {room['floor']}" if room.get("floor") else ""
-    message = "\n".join([
-        "🏠 UR 新空房提醒",
-        "",
-        f"{room['name']}{room_name} — {room['layout']}",
-        f"面积：{room['area']}㎡{floor}",
-        f"租金：{room.get('rent') or '官网确认'}{fee}",
-        "",
-        "先着順です。条件を確認して、対応可能ならすぐ仮申込してください。",
-    ])
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "disable_web_page_preview": True,
-        "reply_markup": {"inline_keyboard": [[{"text": "🏠 立即查看・仮申込", "url": room["href"]}]]},
-    }
+    message = "\n".join(["🏠 UR 新空房提醒", "", f"{room['name']}{room_name} — {room['layout']}", f"面积：{room['area']}㎡{floor}", f"租金：{room.get('rent') or '官网确认'}{fee}", "", "先着順です。条件を確認して、対応可能ならすぐ仮申込してください。"])
+    payload = {"chat_id": chat_id, "text": message, "disable_web_page_preview": True, "reply_markup": {"inline_keyboard": [[{"text": "🏠 立即查看・仮申込", "url": room["href"]}]]}}
     r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json=payload, timeout=TIMEOUT)
     r.raise_for_status()
-    data = r.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Telegram API rejected message: {data}")
+    if not r.json().get("ok"):
+        raise RuntimeError("Telegram API rejected message")
     return True
 
 
@@ -211,34 +214,21 @@ def main():
     previous = set(state.get("room_keys", []))
     current_rooms = []
     errors = []
-
     with requests.Session() as session:
         for target in cfg["targets"]:
             try:
                 current_rooms.extend(fetch_vacant_rooms(session, target, layouts, min_area))
             except Exception as e:
                 errors.append(f"{target['name']}: {e}")
-
     if errors:
         print("UR vacancy check failed; preserving previous state.", file=sys.stderr)
         print("\n".join(errors), file=sys.stderr)
         return 1
-
     unique = {room_key(r): r for r in current_rooms}
     current_keys = set(unique)
-    new_keys = current_keys - previous
-    new_rooms = [unique[k] for k in sorted(new_keys)]
+    new_rooms = [unique[k] for k in sorted(current_keys - previous)]
     notify_rooms = new_rooms if bool(state.get("initialized")) else []
-
-    new_state = {
-        "initialized": True,
-        "checked_at": datetime.now().astimezone().isoformat(),
-        "room_keys": sorted(current_keys),
-        "rooms": list(unique.values()),
-        "errors": [],
-    }
-    STATE_FILE.write_text(json.dumps(new_state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
+    STATE_FILE.write_text(json.dumps({"initialized": True, "checked_at": datetime.now().astimezone().isoformat(), "room_keys": sorted(current_keys), "rooms": list(unique.values()), "errors": []}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if notify_rooms:
         notice = format_notice(notify_rooms)
         OUTPUT_FILE.write_text(notice + "\n", encoding="utf-8")
@@ -249,7 +239,6 @@ def main():
                 print(f"Telegram send failed for {room.get('href')}: {e}", file=sys.stderr)
         print(notice)
         return 10
-
     OUTPUT_FILE.write_text("", encoding="utf-8")
     print(f"No new target rooms. Parsed {len(current_rooms)} real matching rooms. Errors: 0")
     return 0
