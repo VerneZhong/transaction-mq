@@ -102,8 +102,6 @@ def fetch_vacant_rooms(session, target, layouts, min_area):
             layout = str(item.get("type") or "").strip()
             area = parse_area(item.get("floorspace"))
 
-            # Only real vacant-room records can match. This intentionally
-            # rejects generic layout-filter text from the public HTML page.
             if layout not in layouts or area is None or area < min_area:
                 continue
 
@@ -136,17 +134,57 @@ def fetch_vacant_rooms(session, target, layouts, min_area):
     return rooms
 
 
-def telegram_send(message):
+def telegram_credentials():
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    return token, chat_id
+
+
+def telegram_send_room(room):
+    """Send one room per Telegram message with a tappable UR action button."""
+    token, chat_id = telegram_credentials()
     if not token or not chat_id:
         return False
-    r = requests.post(
+
+    fee = f"（共益費 {room['commonfee']}）" if room.get("commonfee") else ""
+    room_name = f" {room['room']}" if room.get("room") else ""
+    floor = f" / {room['floor']}" if room.get("floor") else ""
+    message = "\n".join(
+        [
+            "🏠 UR 新空房提醒",
+            "",
+            f"{room['name']}{room_name} — {room['layout']}",
+            f"面积：{room['area']}㎡{floor}",
+            f"租金：{room.get('rent') or '官网确认'}{fee}",
+            "",
+            "先着順です。条件を確認して、対応可能ならすぐ仮申込してください。",
+        ]
+    )
+
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "disable_web_page_preview": True,
+        "reply_markup": {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "🏠 立即查看・仮申込",
+                        "url": room["href"],
+                    }
+                ]
+            ]
+        },
+    }
+    response = requests.post(
         f"https://api.telegram.org/bot{token}/sendMessage",
-        json={"chat_id": chat_id, "text": message, "disable_web_page_preview": False},
+        json=payload,
         timeout=TIMEOUT,
     )
-    r.raise_for_status()
+    response.raise_for_status()
+    data = response.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API rejected message: {data}")
     return True
 
 
@@ -184,9 +222,6 @@ def main():
             except Exception as e:
                 errors.append(f"{target['name']}: {e}")
 
-    # Never turn an API/network failure into a fake 'zero vacancy' snapshot.
-    # Abort without touching state so the next healthy run compares against the
-    # last known-good snapshot instead of generating false recovery alerts.
     if errors:
         print("UR vacancy check failed; preserving previous state.", file=sys.stderr)
         print("\n".join(errors), file=sys.stderr)
@@ -212,10 +247,11 @@ def main():
     if notify_rooms:
         notice = format_notice(notify_rooms)
         OUTPUT_FILE.write_text(notice + "\n", encoding="utf-8")
-        try:
-            telegram_send(notice.replace("# ", "").replace("## ", ""))
-        except Exception as e:
-            print(f"Telegram send failed: {e}", file=sys.stderr)
+        for room in notify_rooms:
+            try:
+                telegram_send_room(room)
+            except Exception as e:
+                print(f"Telegram send failed for {room.get('href')}: {e}", file=sys.stderr)
         print(notice)
         return 10
 
