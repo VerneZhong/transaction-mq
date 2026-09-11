@@ -9,7 +9,6 @@ from urllib.parse import urljoin
 
 import requests
 import yaml
-from bs4 import BeautifulSoup
 
 ROOT = Path(__file__).resolve().parent
 STATE_FILE = ROOT / "state.json"
@@ -17,6 +16,7 @@ CONFIG_FILE = ROOT / "config.yml"
 OUTPUT_FILE = ROOT / "notification.md"
 UA = "Mozilla/5.0 (compatible; UR-House-Watcher/1.0; +https://github.com/)"
 TIMEOUT = 25
+UR_API = "https://chintai.sumai.ur-net.go.jp/chintai/api/bukken/detail/detail_bukken_room/"
 
 
 def load_json(path, default):
@@ -26,67 +26,117 @@ def load_json(path, default):
         return default
 
 
-def normalize(text):
-    return re.sub(r"\s+", " ", text or "").strip()
-
-
 def room_key(room):
-    raw = "|".join(str(room.get(k, "")) for k in ("name", "layout", "area", "rent", "href", "text"))
+    # A UR JKSS room URL is the most stable identifier. Keep a fallback for safety.
+    raw = room.get("href") or "|".join(
+        str(room.get(k, "")) for k in ("name", "layout", "area", "rent", "room")
+    )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
-def parse_number(text):
-    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:㎡|m²|m2)", text, re.I)
+def parse_property_code(url):
+    """Parse AA_BBBC from an UR property URL into shisya/danchi/shikibetu."""
+    m = re.search(r"/(\d{2})_(\d{3})(\d)\.html", url)
+    if not m:
+        raise ValueError(f"Cannot parse UR property code from URL: {url}")
+    return m.group(1), m.group(2), m.group(3)
+
+
+def parse_area(value):
+    if value is None:
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:㎡|m²|m2)", str(value), re.I)
     return float(m.group(1)) if m else None
 
 
-def extract_rooms(html, base_url, name, layouts, min_area):
-    soup = BeautifulSoup(html, "html.parser")
+def fetch_vacant_rooms(session, target, layouts, min_area):
+    """Fetch current vacant rooms directly from UR's room-list API."""
+    shisya, danchi, shikibetu = parse_property_code(target["url"])
     rooms = []
-    seen = set()
+    seen_ids = set()
 
-    # UR can change markup. Instead of depending on one CSS class, inspect
-    # compact ancestor blocks around links/text that contain a target layout.
-    for node in soup.find_all(string=True):
-        text = normalize(str(node))
-        if not any(layout.lower() in text.lower() for layout in layouts):
-            continue
+    # UR historically paginates this endpoint. Stop when a page is empty/null,
+    # returns no new room IDs, or the reported total count has been collected.
+    for page_index in range(20):
+        response = session.post(
+            UR_API,
+            data={
+                "shisya": shisya,
+                "danchi": danchi,
+                "shikibetu": shikibetu,
+                "orderByField": "0",
+                "orderBySort": "0",
+                "pageIndex": str(page_index),
+            },
+            timeout=TIMEOUT,
+            headers={
+                "User-Agent": UA,
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Accept-Language": "ja-JP,ja;q=0.9",
+                "Referer": target["url"],
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not data:
+            break
+        if not isinstance(data, list):
+            raise ValueError(f"Unexpected UR API response type: {type(data).__name__}")
 
-        block = node.parent
-        for _ in range(5):
-            if not block or not getattr(block, "get_text", None):
-                break
-            block_text = normalize(block.get_text(" ", strip=True))
-            if 20 <= len(block_text) <= 900:
-                area = parse_number(block_text)
-                if area is None or area >= min_area:
-                    layout = next((x for x in layouts if x.lower() in block_text.lower()), None)
-                    rent_match = re.search(r"(?:賃料)?\s*([\d,]+)\s*円", block_text)
-                    rent = rent_match.group(1) + "円" if rent_match else ""
-                    link = block.find("a", href=True)
-                    href = urljoin(base_url, link["href"]) if link else base_url
-                    room = {
-                        "name": name,
-                        "layout": layout,
-                        "area": area,
-                        "rent": rent,
-                        "href": href,
-                        "text": block_text[:500],
-                    }
-                    key = room_key(room)
-                    if key not in seen:
-                        seen.add(key)
-                        rooms.append(room)
-                break
-            block = block.parent
+        new_ids_this_page = 0
+        reported_total = None
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+
+            if reported_total is None:
+                try:
+                    reported_total = int(item.get("allCount"))
+                except (TypeError, ValueError):
+                    reported_total = None
+
+            room_id = str(item.get("id") or "").strip()
+            if not room_id or room_id in seen_ids:
+                continue
+            seen_ids.add(room_id)
+            new_ids_this_page += 1
+
+            layout = str(item.get("type") or "").strip()
+            area = parse_area(item.get("floorspace"))
+
+            # Strict filtering: unlike the old HTML parser, a match must be an
+            # actual vacant room record with both target layout and floor area.
+            if layout not in layouts or area is None or area < min_area:
+                continue
+
+            room_link = item.get("roomDetailLink") or item.get("roomDetailLinkSp")
+            if room_link:
+                href = urljoin("https://www.ur-net.go.jp", room_link)
+            else:
+                room_page = target.get("room_url") or target["url"].replace(".html", "_room.html")
+                href = f"{room_page}?JKSS={room_id}"
+
+            rooms.append(
+                {
+                    "name": target["name"],
+                    "room": str(item.get("name") or "").strip(),
+                    "layout": layout,
+                    "area": area,
+                    "rent": str(item.get("rent") or "").strip(),
+                    "commonfee": str(item.get("commonfee") or "").strip(),
+                    "floor": str(item.get("floor") or "").strip(),
+                    "href": href,
+                    "jkss": room_id,
+                }
+            )
+
+        if new_ids_this_page == 0:
+            break
+        if reported_total is not None and len(seen_ids) >= reported_total:
+            break
 
     return rooms
-
-
-def fetch(session, url):
-    r = session.get(url, timeout=TIMEOUT, headers={"User-Agent": UA, "Accept-Language": "ja-JP,ja;q=0.9"})
-    r.raise_for_status()
-    return r.text
 
 
 def telegram_send(message):
@@ -107,9 +157,16 @@ def format_notice(new_rooms):
     now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
     lines = ["# 🏠 UR 新空房提醒", "", f"检查时间：{now}", ""]
     for r in new_rooms:
-        area = f"{r['area']}㎡" if r.get("area") is not None else "面积未解析"
-        rent = r.get("rent") or "租金请打开官网确认"
-        lines += [f"## {r['name']} — {r.get('layout') or '目标户型'}", f"- 面积：{area}", f"- 租金：{rent}", f"- UR：{r['href']}", ""]
+        fee = f"（共益費 {r['commonfee']}）" if r.get("commonfee") else ""
+        room = f" {r['room']}" if r.get("room") else ""
+        floor = f" / {r['floor']}" if r.get("floor") else ""
+        lines += [
+            f"## {r['name']}{room} — {r['layout']}",
+            f"- 面积：{r['area']}㎡{floor}",
+            f"- 租金：{r.get('rent') or '官网确认'}{fee}",
+            f"- UR：{r['href']}",
+            "",
+        ]
     lines += ["> UR 房源先着顺。收到提醒后建议立即打开官网确认。"]
     return "\n".join(lines)
 
@@ -125,24 +182,16 @@ def main():
 
     with requests.Session() as session:
         for target in cfg["targets"]:
-            urls = [target.get("room_url"), target.get("url")]
-            target_rooms = []
-            for url in [u for u in urls if u]:
-                try:
-                    html = fetch(session, url)
-                    target_rooms = extract_rooms(html, url, target["name"], layouts, min_area)
-                    if target_rooms:
-                        break
-                except Exception as e:
-                    errors.append(f"{target['name']} {url}: {e}")
-            current_rooms.extend(target_rooms)
+            try:
+                current_rooms.extend(fetch_vacant_rooms(session, target, layouts, min_area))
+            except Exception as e:
+                errors.append(f"{target['name']}: {e}")
 
     unique = {room_key(r): r for r in current_rooms}
     current_keys = set(unique)
     new_keys = current_keys - previous
     new_rooms = [unique[k] for k in sorted(new_keys)]
 
-    # First run establishes a baseline and does not spam historical matches.
     initialized = bool(state.get("initialized"))
     notify_rooms = new_rooms if initialized else []
 
@@ -166,7 +215,7 @@ def main():
         return 10
 
     OUTPUT_FILE.write_text("", encoding="utf-8")
-    print(f"No new target rooms. Parsed {len(current_rooms)} matches. Errors: {len(errors)}")
+    print(f"No new target rooms. Parsed {len(current_rooms)} real matching rooms. Errors: {len(errors)}")
     if errors:
         print("\n".join(errors), file=sys.stderr)
     return 0
