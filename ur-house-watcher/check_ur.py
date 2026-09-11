@@ -27,7 +27,6 @@ def load_json(path, default):
 
 
 def room_key(room):
-    # A UR JKSS room URL is the most stable identifier. Keep a fallback for safety.
     raw = room.get("href") or "|".join(
         str(room.get(k, "")) for k in ("name", "layout", "area", "rent", "room")
     )
@@ -55,8 +54,6 @@ def fetch_vacant_rooms(session, target, layouts, min_area):
     rooms = []
     seen_ids = set()
 
-    # UR historically paginates this endpoint. Stop when a page is empty/null,
-    # returns no new room IDs, or the reported total count has been collected.
     for page_index in range(20):
         response = session.post(
             UR_API,
@@ -105,8 +102,8 @@ def fetch_vacant_rooms(session, target, layouts, min_area):
             layout = str(item.get("type") or "").strip()
             area = parse_area(item.get("floorspace"))
 
-            # Strict filtering: unlike the old HTML parser, a match must be an
-            # actual vacant room record with both target layout and floor area.
+            # Only real vacant-room records can match. This intentionally
+            # rejects generic layout-filter text from the public HTML page.
             if layout not in layouts or area is None or area < min_area:
                 continue
 
@@ -187,6 +184,14 @@ def main():
             except Exception as e:
                 errors.append(f"{target['name']}: {e}")
 
+    # Never turn an API/network failure into a fake 'zero vacancy' snapshot.
+    # Abort without touching state so the next healthy run compares against the
+    # last known-good snapshot instead of generating false recovery alerts.
+    if errors:
+        print("UR vacancy check failed; preserving previous state.", file=sys.stderr)
+        print("\n".join(errors), file=sys.stderr)
+        return 1
+
     unique = {room_key(r): r for r in current_rooms}
     current_keys = set(unique)
     new_keys = current_keys - previous
@@ -200,7 +205,7 @@ def main():
         "checked_at": datetime.now().astimezone().isoformat(),
         "room_keys": sorted(current_keys),
         "rooms": list(unique.values()),
-        "errors": errors,
+        "errors": [],
     }
     STATE_FILE.write_text(json.dumps(new_state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -215,9 +220,7 @@ def main():
         return 10
 
     OUTPUT_FILE.write_text("", encoding="utf-8")
-    print(f"No new target rooms. Parsed {len(current_rooms)} real matching rooms. Errors: {len(errors)}")
-    if errors:
-        print("\n".join(errors), file=sys.stderr)
+    print(f"No new target rooms. Parsed {len(current_rooms)} real matching rooms. Errors: 0")
     return 0
 
 
