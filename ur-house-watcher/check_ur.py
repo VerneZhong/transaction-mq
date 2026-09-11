@@ -2,22 +2,19 @@ import hashlib
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import urljoin
 
 import requests
 import yaml
-from bs4 import BeautifulSoup
 
 ROOT = Path(__file__).resolve().parent
 STATE_FILE = ROOT / "state.json"
 CONFIG_FILE = ROOT / "config.yml"
 OUTPUT_FILE = ROOT / "notification.md"
-TIMEOUT = 25
+TIMEOUT = 20
 
 
 def load_json(path, default):
@@ -27,10 +24,6 @@ def load_json(path, default):
         return default
 
 
-def normalize(text):
-    return re.sub(r"\s+", " ", text or "").strip()
-
-
 def room_key(room):
     raw = room.get("jkss") or room.get("href") or "|".join(
         str(room.get(k, "")) for k in ("name", "layout", "area", "rent", "room")
@@ -38,159 +31,161 @@ def room_key(room):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
-def parse_area(text):
-    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:㎡|m²|m2)", text or "", re.I)
+def parse_property_code(url):
+    m = re.search(r"/(\d{2})_(\d{3})(\d)\.html", url)
+    if not m:
+        raise ValueError(f"Cannot parse UR property code from URL: {url}")
+    return m.group(1), m.group(2), m.group(3)
+
+
+def parse_area(value):
+    if value is None:
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:㎡|m²|m2)", str(value), re.I)
     return float(m.group(1)) if m else None
 
 
-def chrome_binary():
-    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
-        path = shutil.which(name)
-        if path:
-            return path
-    raise RuntimeError("Chrome/Chromium is not installed on this runner")
-
-
-def render_page(url):
-    """Render the official UR page in headless Chrome so its current JS can load vacancies."""
-    cmd = [
-        chrome_binary(),
-        "--headless=new",
-        "--no-sandbox",
-        "--disable-gpu",
-        "--disable-dev-shm-usage",
-        "--disable-background-networking",
-        "--disable-default-apps",
-        "--disable-extensions",
-        "--hide-scrollbars",
-        "--window-size=1280,1600",
-        "--virtual-time-budget=12000",
-        "--dump-dom",
-        url,
+def candidate_api_urls():
+    # UR's former dedicated API host is no longer reliably resolvable from
+    # GitHub-hosted runners. Try the current public-site routes first and keep
+    # the historical host only as a last fallback.
+    path = "chintai/api/bukken/detail/detail_bukken_room/"
+    return [
+        f"https://www.ur-net.go.jp/{path}",
+        f"https://sumai.r6.ur-net.go.jp/{path}",
+        f"https://chintai.sumai.ur-net.go.jp/{path}",
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
-    if proc.returncode != 0:
-        err = normalize(proc.stderr)[-800:]
-        raise RuntimeError(f"headless Chrome failed ({proc.returncode}): {err}")
-    html = proc.stdout
-    if len(html) < 1000 or "ur-net.go.jp" not in html.lower():
-        raise RuntimeError(f"rendered page looks incomplete ({len(html)} bytes)")
-    return html
 
 
-def extract_room_from_link(link, base_url, target_name, layouts, min_area):
-    href = urljoin(base_url, link.get("href", ""))
-    qs = parse_qs(urlparse(href).query)
-    room_id = (qs.get("JKSS") or qs.get("jkss") or [""])[0].strip()
-    if not room_id:
-        return None
-
-    # Starting from a real JKSS link, walk upward until we reach the smallest
-    # card-like block containing layout and floor area. This avoids the old
-    # false positive from the generic layout filter menu.
-    block = link
-    chosen_text = ""
-    for _ in range(10):
-        block = getattr(block, "parent", None)
-        if block is None or not hasattr(block, "get_text"):
-            break
-        text = normalize(block.get_text(" ", strip=True))
-        area = parse_area(text)
-        layout = next((x for x in layouts if re.search(rf"(?<![A-Z0-9]){re.escape(x)}(?![A-Z0-9])", text, re.I)), None)
-        if layout and area is not None:
-            chosen_text = text
-            break
-
-    if not chosen_text:
-        return None
-
-    area = parse_area(chosen_text)
-    layout = next((x for x in layouts if re.search(rf"(?<![A-Z0-9]){re.escape(x)}(?![A-Z0-9])", chosen_text, re.I)), None)
-    if not layout or area is None or area < min_area:
-        return None
-
-    room_match = re.search(r"([0-9A-Za-z\-]+号室)", chosen_text)
-    rent_match = re.search(r"(?<!共益費)\s*([\d,]{4,})\s*円", chosen_text)
-    fee_match = re.search(r"共益費\s*[:：]?\s*([\d,]+\s*円)", chosen_text)
-    floor_match = re.search(r"(\d+階(?:\s*/\s*\d+階)?)", chosen_text)
-
-    return {
-        "name": target_name,
-        "room": room_match.group(1) if room_match else "",
-        "layout": layout,
-        "area": area,
-        "rent": (rent_match.group(1) + "円") if rent_match else "",
-        "commonfee": fee_match.group(1).replace(" ", "") if fee_match else "",
-        "floor": floor_match.group(1).replace(" ", "") if floor_match else "",
-        "href": href,
-        "jkss": room_id,
+def post_room_api(session, target, page_index):
+    shisya, danchi, shikibetu = parse_property_code(target["url"])
+    payload = {
+        "shisya": shisya,
+        "danchi": danchi,
+        "shikibetu": shikibetu,
+        "orderByField": "0",
+        "orderBySort": "0",
+        "pageIndex": str(page_index),
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "ja-JP,ja;q=0.9",
+        "Referer": target.get("room_url") or target["url"],
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": "https://www.ur-net.go.jp",
     }
 
+    failures = []
+    for api_url in candidate_api_urls():
+        try:
+            r = session.post(api_url, data=payload, headers=headers, timeout=TIMEOUT, allow_redirects=True)
+            ctype = r.headers.get("content-type", "")
+            if r.status_code >= 400:
+                failures.append(f"{api_url} -> HTTP {r.status_code}")
+                continue
+            if "json" not in ctype.lower() and not r.text.lstrip().startswith(("[", "null")):
+                failures.append(f"{api_url} -> non-JSON {ctype or 'unknown'}")
+                continue
+            data = r.json()
+            if data is None or isinstance(data, list):
+                print(f"{target['name']}: API OK via {api_url}")
+                return data
+            failures.append(f"{api_url} -> unexpected {type(data).__name__}")
+        except Exception as e:
+            failures.append(f"{api_url} -> {type(e).__name__}: {e}")
 
-def fetch_vacant_rooms(target, layouts, min_area):
-    """Read vacancies from the JS-rendered official UR room-list page."""
-    url = target.get("room_url") or target["url"].replace(".html", "_room.html")
-    html = render_page(url)
-    soup = BeautifulSoup(html, "html.parser")
+    raise RuntimeError("; ".join(failures))
 
-    # The page is considered healthy only if its core room-list UI was rendered.
-    page_text = normalize(soup.get_text(" ", strip=True))
-    if target["name"] not in page_text or "部屋情報" not in page_text:
-        raise RuntimeError("UR page rendered, but expected room-list content is missing")
 
-    rooms_by_id = {}
-    for link in soup.find_all("a", href=True):
-        if "JKSS=" not in link["href"] and "jkss=" not in link["href"]:
-            continue
-        room = extract_room_from_link(link, url, target["name"], layouts, min_area)
-        if room:
-            rooms_by_id[room["jkss"]] = room
+def fetch_vacant_rooms(session, target, layouts, min_area):
+    rooms = []
+    seen_ids = set()
 
-    print(f"{target['name']}: rendered OK, found {len(rooms_by_id)} matching vacant rooms")
-    return list(rooms_by_id.values())
+    for page_index in range(20):
+        data = post_room_api(session, target, page_index)
+        if not data:
+            break
+
+        new_ids = 0
+        reported_total = None
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            if reported_total is None:
+                try:
+                    reported_total = int(item.get("allCount"))
+                except (TypeError, ValueError):
+                    reported_total = None
+
+            room_id = str(item.get("id") or "").strip()
+            if not room_id or room_id in seen_ids:
+                continue
+            seen_ids.add(room_id)
+            new_ids += 1
+
+            layout = str(item.get("type") or "").strip()
+            area = parse_area(item.get("floorspace"))
+            if layout not in layouts or area is None or area < min_area:
+                continue
+
+            room_link = item.get("roomDetailLink") or item.get("roomDetailLinkSp")
+            if room_link:
+                href = urljoin("https://www.ur-net.go.jp", room_link)
+            else:
+                room_page = target.get("room_url") or target["url"].replace(".html", "_room.html")
+                href = f"{room_page}?JKSS={room_id}"
+
+            rooms.append({
+                "name": target["name"],
+                "room": str(item.get("name") or "").strip(),
+                "layout": layout,
+                "area": area,
+                "rent": str(item.get("rent") or "").strip(),
+                "commonfee": str(item.get("commonfee") or "").strip(),
+                "floor": str(item.get("floor") or "").strip(),
+                "href": href,
+                "jkss": room_id,
+            })
+
+        if new_ids == 0:
+            break
+        if reported_total is not None and len(seen_ids) >= reported_total:
+            break
+
+    print(f"{target['name']}: found {len(rooms)} matching vacant rooms")
+    return rooms
 
 
 def telegram_credentials():
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    return token, chat_id
+    return os.getenv("TELEGRAM_BOT_TOKEN", "").strip(), os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 
 def telegram_send_room(room):
     token, chat_id = telegram_credentials()
     if not token or not chat_id:
         return False
-
     fee = f"（共益費 {room['commonfee']}）" if room.get("commonfee") else ""
     room_name = f" {room['room']}" if room.get("room") else ""
     floor = f" / {room['floor']}" if room.get("floor") else ""
-    message = "\n".join(
-        [
-            "🏠 UR 新空房提醒",
-            "",
-            f"{room['name']}{room_name} — {room['layout']}",
-            f"面积：{room['area']}㎡{floor}",
-            f"租金：{room.get('rent') or '官网确认'}{fee}",
-            "",
-            "先着順です。条件を確認して、対応可能ならすぐ仮申込してください。",
-        ]
-    )
-
+    message = "\n".join([
+        "🏠 UR 新空房提醒",
+        "",
+        f"{room['name']}{room_name} — {room['layout']}",
+        f"面积：{room['area']}㎡{floor}",
+        f"租金：{room.get('rent') or '官网确认'}{fee}",
+        "",
+        "先着順です。条件を確認して、対応可能ならすぐ仮申込してください。",
+    ])
     payload = {
         "chat_id": chat_id,
         "text": message,
         "disable_web_page_preview": True,
-        "reply_markup": {
-            "inline_keyboard": [[{"text": "🏠 立即查看・仮申込", "url": room["href"]}]]
-        },
+        "reply_markup": {"inline_keyboard": [[{"text": "🏠 立即查看・仮申込", "url": room["href"]}]]},
     }
-    response = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json=payload,
-        timeout=TIMEOUT,
-    )
-    response.raise_for_status()
-    data = response.json()
+    r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json=payload, timeout=TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
     if not data.get("ok"):
         raise RuntimeError(f"Telegram API rejected message: {data}")
     return True
@@ -203,13 +198,7 @@ def format_notice(new_rooms):
         fee = f"（共益費 {r['commonfee']}）" if r.get("commonfee") else ""
         room = f" {r['room']}" if r.get("room") else ""
         floor = f" / {r['floor']}" if r.get("floor") else ""
-        lines += [
-            f"## {r['name']}{room} — {r['layout']}",
-            f"- 面积：{r['area']}㎡{floor}",
-            f"- 租金：{r.get('rent') or '官网确认'}{fee}",
-            f"- UR：{r['href']}",
-            "",
-        ]
+        lines += [f"## {r['name']}{room} — {r['layout']}", f"- 面积：{r['area']}㎡{floor}", f"- 租金：{r.get('rent') or '官网确认'}{fee}", f"- UR：{r['href']}", ""]
     lines += ["> UR 房源先着顺。收到提醒后建议立即打开官网确认。"]
     return "\n".join(lines)
 
@@ -223,13 +212,13 @@ def main():
     current_rooms = []
     errors = []
 
-    for target in cfg["targets"]:
-        try:
-            current_rooms.extend(fetch_vacant_rooms(target, layouts, min_area))
-        except Exception as e:
-            errors.append(f"{target['name']}: {e}")
+    with requests.Session() as session:
+        for target in cfg["targets"]:
+            try:
+                current_rooms.extend(fetch_vacant_rooms(session, target, layouts, min_area))
+            except Exception as e:
+                errors.append(f"{target['name']}: {e}")
 
-    # Never replace the last good snapshot when UR cannot be checked.
     if errors:
         print("UR vacancy check failed; preserving previous state.", file=sys.stderr)
         print("\n".join(errors), file=sys.stderr)
@@ -239,9 +228,7 @@ def main():
     current_keys = set(unique)
     new_keys = current_keys - previous
     new_rooms = [unique[k] for k in sorted(new_keys)]
-
-    initialized = bool(state.get("initialized"))
-    notify_rooms = new_rooms if initialized else []
+    notify_rooms = new_rooms if bool(state.get("initialized")) else []
 
     new_state = {
         "initialized": True,
