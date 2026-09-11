@@ -5,6 +5,12 @@ on:
     # GitHub cron is UTC: 00:00 UTC = 09:00 JST
     - cron: "0 0 * * *"
   workflow_dispatch:
+    inputs:
+      send_test_notification:
+        description: "Send a Telegram test notification only"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -31,8 +37,31 @@ jobs:
       - name: Install dependencies
         run: pip install -r ur-house-watcher/requirements.txt
 
+      - name: Send Telegram test notification
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.send_test_notification == true }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        shell: bash
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "Telegram secrets are missing."
+            exit 1
+          fi
+
+          TEXT=$'✅ UR House Watcher 测试成功\n\nTelegram Bot 配置正常。\n当前监控：大島四丁目 / 大島六丁目\n条件：2LDK / 3DK，50㎡以上'
+
+          response=$(curl --silent --show-error --fail-with-body \
+            --request POST \
+            --url "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}")
+
+          echo "$response" | python -c 'import json,sys; d=json.load(sys.stdin); assert d.get("ok") is True, d; print("Telegram test notification sent successfully.")'
+
       - name: Check UR vacancies
         id: check
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.send_test_notification == true) }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -57,6 +86,7 @@ jobs:
             --body-file ur-house-watcher/notification.md
 
       - name: Persist watcher state
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.send_test_notification == true) }}
         run: |
           if git diff --quiet -- ur-house-watcher/state.json; then
             echo "No state change"
