@@ -51,15 +51,17 @@ jobs:
             exit 1
           fi
 
-          TEXT=$'✅ UR House Watcher 测试成功\n\nTelegram Bot 配置正常。\n当前监控：大島四丁目 / 大島六丁目\n条件：2LDK / 3DK，50㎡以上'
+          TEXT=$'✅ UR House Watcher 测试成功\n\nTelegram Bot 配置正常。\n当前监控：大島四丁目 / 大島六丁目\n条件：2LDK / 3DK，50㎡以上\n\n下面按钮用于确认真实通知中的点击跳转样式。'
+          REPLY_MARKUP='{"inline_keyboard":[[{"text":"🏠 立即查看・仮申込（测试）","url":"https://www.ur-net.go.jp/chintai/kanto/tokyo/20_1920_room.html"}]]}'
 
           response=$(curl --silent --show-error --fail-with-body \
             --request POST \
             --url "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=${TEXT}")
+            --data-urlencode "text=${TEXT}" \
+            --data-urlencode "reply_markup=${REPLY_MARKUP}")
 
-          echo "$response" | python -c 'import json,sys; d=json.load(sys.stdin); assert d.get("ok") is True, d; print("Telegram test notification sent successfully.")'
+          echo "$response" | python -c 'import json,sys; d=json.load(sys.stdin); assert d.get("ok") is True, d; print("Telegram test notification with clickable UR button sent successfully.")'
 
       - name: Check UR vacancies
         id: check
